@@ -151,6 +151,55 @@ def main():
                 sock.send_json({"status": "bye"})  # reply
                 break  # exit the while-loop
 
+            if msg.get("eval_only_with_adapter"):
+                try:
+                    adapter_path = msg.get("adapter_path")
+                    questions = msg.get("eval_questions", [])
+                    
+                    LOG.info(f"Eval-only with adapter: {adapter_path}")
+                    
+                    # Load the adapter temporarily
+                    adapter_name = f"temp_eval_{step}"
+                    load_adapter(adapter_path, adapter_name)
+                    
+                    # Evaluate with the adapter
+                    sampling_cfg = {
+                        "n": 1,
+                        "temperature": args.eval_temperature,
+                        "top_p": args.eval_top_p,
+                        "max_tokens": args.eval_max_tokens,
+                    }
+                    
+                    adapter_acc, adapter_texts, adapter_ok = accuracy_and_texts(
+                        questions,
+                        answer_model_ref=adapter_name,
+                        sampling=sampling_cfg,
+                        stop_ids=stop_ids,
+                        instruct_model=args.instruct_model,
+                        chain_of_thought=False,
+                    )
+                    
+                    # Unload the adapter
+                    unload_adapter(adapter_name)
+                    
+                    reply = {
+                        "adapter_accuracy": round(adapter_acc, 4),
+                        "adapter_texts": adapter_texts,
+                        "adapter_correct": adapter_ok,
+                    }
+                    
+                    LOG.info(f"Eval-only result: acc={adapter_acc:.3f}")
+
+                except Exception as e:
+                    LOG.exception("Error during eval-only with adapter.")
+                    reply = {"error": f"{type(e).__name__}: {e}"}
+
+
+                sock.send_json(reply)
+                step += 1
+                continue  # Skip the rest of the loop
+
+
             recv_start = time.time()
             try:
                 LOG.debug("RX %d %s", step, msg.keys())

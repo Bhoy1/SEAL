@@ -39,12 +39,13 @@ import sys
 import time
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 import requests
 import torch
 import zmq
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from safetensors.torch import load_file, save_file
 
 from ..utils import (
     set_vllm_api_url,
@@ -151,6 +152,122 @@ def _send_round(sock, train_seqs: List[str], questions: List[Dict[str, str]], ar
     )
     return sock.recv_json()
 
+
+##################
+###############################################################################
+#                          Safety mechanisms                                  #
+###############################################################################
+
+def _send_eval_with_adapter(sock, adapter_path: Path, questions: List[Dict[str, str]]) -> Dict:
+    """Special request to evaluate with a specific adapter loaded."""
+    sock.send_json(
+        {
+            "eval_only_with_adapter": True,
+            "adapter_path": str(adapter_path),
+            "eval_questions": questions,
+        }
+    )
+    return sock.recv_json()
+
+
+def measure_em_drop(zmq_sock, anchors: List[Dict], anchor_questions: List[Dict], 
+                     adapter_path: Path, args) -> float:
+    """Measure EM accuracy drop on anchor questions."""
+    if not anchors or not anchor_questions:
+        return 0.0
+    
+    # Get baseline accuracy (no adapter)
+    base_response = _send_round(zmq_sock, [], anchor_questions, args)
+    base_correct = base_response["adapter_correct"]
+    base_em = sum(base_correct) / len(base_correct) if base_correct else 0.0
+    
+    # Get adapter accuracy
+    adapter_response = _send_eval_with_adapter(zmq_sock, adapter_path, anchor_questions)
+    adapter_correct = adapter_response["adapter_correct"]
+    adapter_em = sum(adapter_correct) / len(adapter_correct) if adapter_correct else 0.0
+    
+    em_drop = max(0, base_em - adapter_em)
+    return em_drop
+
+
+def scale_lora_adapter(adapter_path: Path, scale: float) -> Path:
+    """Scale LoRA weights by a factor and return path to scaled adapter."""
+    scaled_path = adapter_path.parent / f"scaled_{scale:.3f}"
+    scaled_path.mkdir(exist_ok=True)
+    
+    # Copy config files
+    for config_file in ["adapter_config.json", "adapter_model.json"]:
+        src = adapter_path / config_file
+        if src.exists():
+            shutil.copy(src, scaled_path / config_file)
+    
+    # Scale the weights
+    for weight_file in adapter_path.glob("*.safetensors"):
+        weights = load_file(weight_file)
+        # Only scale LoRA weights (those with .lora_A or .lora_B in the name)
+        scaled_weights = {}
+        for k, v in weights.items():
+            if "lora_" in k:
+                scaled_weights[k] = v * scale
+            else:
+                scaled_weights[k] = v
+        save_file(scaled_weights, scaled_path / weight_file.name)
+    
+    # If using .bin files instead of safetensors
+    for weight_file in adapter_path.glob("*.bin"):
+        weights = torch.load(weight_file)
+        scaled_weights = {}
+        for k, v in weights.items():
+            if "lora_" in k:
+                scaled_weights[k] = v * scale
+            else:
+                scaled_weights[k] = v
+        torch.save(scaled_weights, scaled_path / weight_file.name)
+    
+    return scaled_path
+
+
+def binary_search_scale(zmq_sock, adapter_path: Path, anchors: List[Dict],
+                        anchor_questions: List[Dict], budget: float, 
+                        metric: str, args) -> Optional[float]:
+    """Binary search for LoRA scaling factor that meets budget."""
+    left, right = args.clip_min_scale, 1.0
+    best_scale = None
+    
+    for step in range(args.clip_bisect_steps):
+        mid = (left + right) / 2
+        
+        # Scale the adapter
+        scaled_adapter_path = scale_lora_adapter(adapter_path, mid)
+        
+        # Measure forgetting with scaled adapter
+        if metric == "em":
+            forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions, 
+                                        scaled_adapter_path, args)
+        # TODO: Add bits and KL metrics here
+        else:
+            print(f"[Safety] Warning: metric '{metric}' not yet implemented, using EM")
+            forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions,
+                                        scaled_adapter_path, args)
+        
+        print(f"  [Binary search] scale={mid:.3f}, forgetting={forgetting:.4f}, budget={budget:.4f}")
+        
+        if forgetting <= budget:
+            best_scale = mid
+            left = mid  # Try larger scale
+        else:
+            right = mid  # Try smaller scale
+        
+        # Clean up scaled adapter
+        shutil.rmtree(scaled_adapter_path, ignore_errors=True)
+    
+    return best_scale
+
+###############
+
+
+
+
 ###############################################################################
 #                             LoRA → merge                                    #
 ###############################################################################
@@ -179,6 +296,12 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
     mat_vals: List[List[List[float]]] = [[[] for _ in range(K)] for _ in range(R)]
 
     current_model_path = args.model  # evolves after each merge
+
+    #####
+    anchors = []  # Track datapoints that have been successfully merged
+    rejected_count = 0  # Track rejected edits
+    safety_log = []  # Track safety decisions
+    #######
 
     # -------- 0) Base-model row  (row 0 in mat_vals) ------------------
     base_tag      = f"seq{seq_idx}_base"
@@ -274,42 +397,123 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
         ]
         agg_questions.extend(new_q)
 
+
+
+#############
+        # Prepare anchor questions for safety checks
+        anchor_questions = []
+        for anchor in anchors:
+            for q in anchor["questions"]:
+                anchor_questions.append({
+                    "title": anchor["title"],
+                    "context": anchor["context"],
+                    "question": f"Topic: {anchor['title']}\n{q['question']}",
+                    "answer": q["answer"],
+                })
+
+############
+        
+
         # ---------------- 4) tune-and-eval  -------------------------------
         rep_out = _send_round(zmq_sock, train_sequences, agg_questions, args)
         correct = rep_out["adapter_correct"]
-        for i in range(k + 1):
-            s, e = q_spans[i]
-            acc = sum(correct[s:e]) / (e - s)
-            mat_vals[k+1][i].append(acc)
-        print([f"d{i}:{_stats.mean(mat_vals[k+1][i]):.3f}" for i in range(k + 1)])
+   
 
         # ---------------- 5) grab adapter & merge into base ---------------
         adapter_path = Path(f"models/tmp_{args.zmq_port}_inner_TTT_0/final_adapter")
         print("[Merge] adapter path:", adapter_path)
         if not adapter_path.exists():
             print("[!] adapter not found - skipping merge, keeping previous base")
+            rejected_count += 1
+            safety_log.append({"step": k, "action": "rejected", "reason": "no_adapter"})
         else:
-            merged_dir = Path(args.output_dir) / f"merged_seq{seq_idx}_step{k}"
-            prev_model_path = current_model_path
-            current_model_path = _merge_lora(current_model_path, adapter_path, merged_dir)
-
-            # Clean up previous merge dir if it's not the original base
-            if k > 0 and Path(prev_model_path).is_dir() and str(prev_model_path).startswith(str(Path(args.output_dir))):
-                try:
-                    shutil.rmtree(prev_model_path)
-                    print(f"[Cleanup] removed previous merge dir {prev_model_path}")
-                except Exception as exc:
-                    print(f"[Cleanup] failed to remove {prev_model_path}: {exc}")
-
-            # NEW: Also remove last step of previous sequence, if this is first step of current
-            if k == 0 and seq_idx > 0:
-                prev_final_merge = Path(args.output_dir) / f"merged_seq{seq_idx - 1}_step{K - 1}"
-                if prev_final_merge.exists():
+            # ------------ NEW: Safety checks before merging --------------
+            should_merge = True
+            scale_factor = 1.0
+            safety_decision = {"step": k, "action": "accept", "scale": 1.0}
+            
+            if args.safety_mode != "baseline" and anchors:
+                # Measure forgetting
+                if args.forget_metric == "em":
+                    forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions, 
+                                                adapter_path, args)
+                    budget = args.em_max_drop
+                # TODO: Add bits and KL metrics
+                else:
+                    print(f"[Safety] Warning: metric '{args.forget_metric}' not yet implemented, using EM")
+                    forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions,
+                                                adapter_path, args)
+                    budget = args.em_max_drop
+                
+                print(f"[Safety] Step {k}: forgetting={forgetting:.4f}, budget={budget:.4f}")
+                safety_decision["forgetting"] = forgetting
+                safety_decision["budget"] = budget
+                
+                if args.safety_mode == "gate_only":
+                    if forgetting > budget:
+                        should_merge = False
+                        rejected_count += 1
+                        safety_decision["action"] = "rejected"
+                        safety_decision["reason"] = f"forgetting ({forgetting:.4f}) > budget ({budget:.4f})"
+                        print(f"[Safety] REJECTED edit at step {k}")
+                
+                elif args.safety_mode == "lora_clip":
+                    if forgetting > budget:
+                        print(f"[Safety] Forgetting exceeds budget, searching for safe scale...")
+                        scale_factor = binary_search_scale(
+                            zmq_sock, adapter_path, anchors, anchor_questions,
+                            budget, args.forget_metric, args
+                        )
+                        if scale_factor is None or scale_factor < args.clip_min_scale:
+                            should_merge = False
+                            rejected_count += 1
+                            safety_decision["action"] = "rejected"
+                            safety_decision["reason"] = "no_safe_scale_found"
+                            print(f"[Safety] REJECTED edit at step {k} (couldn't find safe scale)")
+                        else:
+                            print(f"[Safety] Scaling adapter by {scale_factor:.3f}")
+                            adapter_path = scale_lora_adapter(adapter_path, scale_factor)
+                            safety_decision["action"] = "scaled"
+                            safety_decision["scale"] = scale_factor
+            
+            safety_log.append(safety_decision)
+            
+            if should_merge:
+                merged_dir = Path(args.output_dir) / f"merged_seq{seq_idx}_step{k}"
+                prev_model_path = current_model_path
+                current_model_path = _merge_lora(current_model_path, adapter_path, merged_dir)
+                
+                # Clean up previous merge dir if it's not the original base
+                if k > 0 and Path(prev_model_path).is_dir() and str(prev_model_path).startswith(str(Path(args.output_dir))):
                     try:
-                        shutil.rmtree(prev_final_merge)
-                        print(f"[Cleanup] removed prior sequence's final merge dir {prev_final_merge}")
+                        shutil.rmtree(prev_model_path)
+                        print(f"[Cleanup] removed previous merge dir {prev_model_path}")
                     except Exception as exc:
-                        print(f"[Cleanup] failed to remove {prev_final_merge}: {exc}")
+                        print(f"[Cleanup] failed to remove {prev_model_path}: {exc}")
+                
+                # Also remove last step of previous sequence, if this is first step of current
+                if k == 0 and seq_idx > 0:
+                    prev_final_merge = Path(args.output_dir) / f"merged_seq{seq_idx - 1}_step{K - 1}"
+                    if prev_final_merge.exists():
+                        try:
+                            shutil.rmtree(prev_final_merge)
+                            print(f"[Cleanup] removed prior sequence's final merge dir {prev_final_merge}")
+                        except Exception as exc:
+                            print(f"[Cleanup] failed to remove {prev_final_merge}: {exc}")
+            else:
+                print(f"[Safety] Skipping merge at step {k}, keeping previous model")
+        
+        # Always add to anchors after evaluation (whether merged or not)
+        anchors.append(item)
+        
+        # Update accuracy matrix (regardless of merge decision)
+        for i in range(k + 1):
+            s, e = q_spans[i]
+            acc = sum(correct[s:e]) / (e - s)
+            mat_vals[k+1][i].append(acc)
+        print([f"d{i}:{_stats.mean(mat_vals[k+1][i]):.3f}" for i in range(k + 1)])
+
+
 
         # ---------------- 6) graceful shutdown ----------------------------
         try:
@@ -340,6 +544,20 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
             print(f"[Cleanup] removed temporary adapter dir {tmp_dir}")
         except Exception as exc:
             print(f"[Cleanup] failed to remove temporary adapter dir {tmp_dir}: {exc}")
+
+
+    
+
+    # Write safety log
+    print(f"\n[Safety Summary] Mode: {args.safety_mode}, Metric: {args.forget_metric}")
+    print(f"[Safety Summary] Rejected {rejected_count}/{K} edits")
+    
+    # Save safety log
+    if args.safety_mode != "baseline":
+        safety_log_path = Path(args.output_dir) / f"safety_log_seq{seq_idx}.json"
+        with safety_log_path.open("w") as f:
+            json.dump(safety_log, f, indent=2)
+        print(f"[Safety] Log saved to {safety_log_path}")
 
     # ---------------- 8) aggregate mean/std over reps --------------------
     mean_mat: List[List[float]] = [[0.0] * K for _ in range(R)]
@@ -388,6 +606,26 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--end_mask_substring", default="")
+
+    # Safety mechanism arguments
+    p.add_argument("--safety_mode", choices=["baseline", "gate_only", "lora_clip"],
+                   default="baseline", help="Safety mode for forgetting prevention")
+    p.add_argument("--forget_metric", choices=["em", "bits", "kl"],
+                   default="em", help="Metric to measure forgetting")
+    
+    # Thresholds for each metric
+    p.add_argument("--em_max_drop", type=float, default=0.0,
+                   help="Max allowed EM drop on anchors (for forget_metric=em)")
+    p.add_argument("--bits_max_total", type=float, default=1.0,
+                   help="Max total bits increase on anchors (for forget_metric=bits)")
+    p.add_argument("--kl_max_bits", type=float, default=0.3,
+                   help="Max mean KL divergence in bits/token (for forget_metric=kl)")
+    
+    # LoRA clipping parameters
+    p.add_argument("--clip_bisect_steps", type=int, default=7,
+                   help="Binary search steps for LoRA scaling")
+    p.add_argument("--clip_min_scale", type=float, default=0.1,
+                   help="Minimum scale factor for LoRA clipping")
 
     p.add_argument("--output_dir", default="general-knowledge/results/continual_self_edits")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
