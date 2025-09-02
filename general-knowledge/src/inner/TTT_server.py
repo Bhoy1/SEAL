@@ -32,8 +32,6 @@ import argparse, gc, logging, os, shutil, time
 from pathlib import Path
 from typing import Dict, List, Any
 import torch
-import torch.nn.functional as F
-import math 
 import zmq
 from datasets import Dataset as HFDataset
 from peft import LoraConfig, get_peft_model
@@ -64,83 +62,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 LOG = logging.getLogger()
-
-
-################
-# ---------------------------  TOKEN STATS HELPERS  -------------------- #
-# We compute optional anchor-level Bits (true-token NLL on answers) and
-# KL (p_base || p_adapter) over prompt tokens in bits/token.
-
-LN2 = math.log(2.0)
-
-def _pack_answer_prompt_and_labels(tokenizer, prompt: str, answer: str, max_len: int):
-    """
-    Return tensors for a single (prompt, answer) where labels are -100 on prompt
-    and equal to answer tokens on the answer span. Truncates to max_len.
-    """
-    enc_p = tokenizer(prompt, add_special_tokens=False)
-    enc_a = tokenizer(answer, add_special_tokens=False)
-
-    input_ids = (enc_p["input_ids"] + enc_a["input_ids"])[:max_len]
-    attn      = [1] * len(input_ids)
-    labels    = ([-100] * len(enc_p["input_ids"]) + enc_a["input_ids"])[:max_len]
-
-    return {
-        "input_ids":       torch.tensor([input_ids], dtype=torch.long),
-        "attention_mask":  torch.tensor([attn], dtype=torch.long),
-        "labels":          torch.tensor([labels], dtype=torch.long),
-        "n_answer_tokens": max(0, min(len(enc_a["input_ids"]), max_len - len(enc_p["input_ids"]))),
-    }
-
-@torch.no_grad()
-def _bits_for_answers(model, tokenizer, qa_batch, max_len: int):
-    """
-    qa_batch: list of (prompt_str, answer_str)
-    Returns per-sample TOTAL bits on the answer tokens (sum, not mean).
-    """
-    model.eval()
-    out = []
-    for prompt, answer in qa_batch:
-        pack = _pack_answer_prompt_and_labels(tokenizer, prompt, answer, max_len)
-        if pack["n_answer_tokens"] == 0:
-            out.append(0.0)
-            continue
-        out_model = model(
-            input_ids=pack["input_ids"].to(model.device),
-            attention_mask=pack["attention_mask"].to(model.device),
-            labels=pack["labels"].to(model.device),
-        )
-        # HF returns mean NLL (nats) over non -100 positions
-        nats_per_tok = float(out_model.loss)
-        total_nats   = nats_per_tok * pack["n_answer_tokens"]
-        out.append(total_nats / LN2)
-    return out
-
-@torch.no_grad()
-def _kl_bits_per_token_on_prompts(base_model, adapter_model, tokenizer, prompts, max_len: int) -> float:
-    """
-    Mean KL(p_base || p_adapter) over prompt tokens (bits/token).
-    Uses next-token formulation on prompt sequences.
-    """
-    base_model.eval(); adapter_model.eval()
-    enc = tokenizer(prompts, add_special_tokens=False, padding=True, truncation=True,
-                    max_length=max_len, return_tensors="pt")
-    input_ids = enc["input_ids"].to(base_model.device)
-    attn      = enc["attention_mask"].to(base_model.device)
-    logits_b  = base_model(input_ids=input_ids, attention_mask=attn).logits
-    logits_a  = adapter_model(input_ids=input_ids, attention_mask=attn).logits
-    logpb     = F.log_softmax(logits_b[:, :-1, :], dim=-1)
-    logpa     = F.log_softmax(logits_a[:, :-1, :], dim=-1)
-    valid     = (attn[:, 1:] > 0).float()
-    # KL in nats/token = sum_v p_b * (log p_b - log p_a)
-    kl_nats   = torch.sum(torch.exp(logpb) * (logpb - logpa), dim=-1) * valid
-    total_nats   = kl_nats.sum().item()
-    total_tokens = valid.sum().item() + 1e-8
-    return float((total_nats / LN2) / total_tokens)
-
-
-
-#############
 
 
 def accuracy_and_texts(
@@ -270,18 +191,10 @@ def main():
                         pass
 
                 if reward_mode in ("proxy", "both"):
-                    # Optional proxy scoring with GPT for the raw completion
                     try:
                         proxy_scores = score_proxy_with_gpt4(title=title, context=article_context, completion=completion_raw)
                     except Exception:
                         proxy_scores = {"length": 1, "diversity": 1, "quality": 1, "correctness": 1, "final": 4}
-
-##########
-                # Build strings once for optional token stats (anchors use a leading slice)
-                answer_prompts = format_answer_prompts(questions, instruct_model=args.instruct_model, chain_of_thought=False)
-                answers_ref    = [q.get("answer","") for q in questions]
-#################
-
 
                 if reward_mode == "proxy":
                     reply = {
@@ -416,37 +329,6 @@ def main():
                     chain_of_thought=chain_of_thought,
                 )
 
-
-##########
-                # ---------- optional token stats for anchors ------------------------- #
-                token_stats = None
-                try:
-                    A = int(msg.get("anchor_count", 0))
-                except Exception:
-                    A = 0
-                if msg.get("return_token_stats", False) and A > 0:
-                    token_stats = {"anchors": A}
-                    # Anchor slices
-                    anc_prompts = answer_prompts[:A]
-                    anc_answers = answers_ref[:A]
-                    which = msg.get("token_stats_what", "bits")
-
-                    if which in ("bits", "both"):
-                        bits_base = _bits_for_answers(base_model,   tokenizer, list(zip(anc_prompts, anc_answers)), max_len=args.max_seq_length)
-                        bits_new  = _bits_for_answers(lora_model,   tokenizer, list(zip(anc_prompts, anc_answers)), max_len=args.max_seq_length)
-                        delta_pos = [max(0.0, n - b) for b, n in zip(bits_base, bits_new)]
-                        token_stats["bits"] = {
-                            "per_sample_base": [float(x) for x in bits_base],
-                            "per_sample_new":  [float(x) for x in bits_new],
-                            "delta_pos_sum":   float(sum(delta_pos)),
-                        }
-                    if which in ("kl", "both"):
-                        kl_bits = _kl_bits_per_token_on_prompts(base_model, lora_model, tokenizer, anc_prompts, max_len=args.max_seq_length)
-                        token_stats["kl"] = {"mean_bits_per_token": float(kl_bits)}
-#################
-
-
-
                 gains = [
                     1  if a and not b else
                     -1 if b and not a else
@@ -469,12 +351,6 @@ def main():
                     "adapter_correct": adapter_ok,
                     "gains": gains,
                 }
-
-#########
-                if token_stats is not None:
-                    reply["token_stats"] = token_stats
-##############
-
                 if reward_mode in ("proxy", "both"):
                     reply["proxy_scores"] = proxy_scores
                     LOG.info("Step %d  Proxy scores: %s", step, proxy_scores)
