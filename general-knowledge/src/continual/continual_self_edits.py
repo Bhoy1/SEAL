@@ -2,6 +2,8 @@
 """
 Incremental self-editing experiment with progressive LoRA merges
 
+****Step-5-first patch: add forgetting-aware gating at merge time (EM now; Bits/KL fall back to EM).***
+
 This script builds a lower-triangular accuracy matrix for K datapoints
 d_0 ... d_{K-1} drawn from a SQuAD-style dataset, repeating the entire
 process S times to obtain good estimates of mean and standard-deviation
@@ -37,6 +39,7 @@ import statistics as _stats
 import subprocess
 import sys
 import time
+import math
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -54,6 +57,50 @@ from ..data_generation.make_squad_data import make_prompt
 
 # Silence transformers warning spam inside forked processes
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+
+
+#####################
+###############################################################################
+#                          Forgetting / Safety helpers                        #
+###############################################################################
+
+def _mean_bool(lst: List[bool]) -> float:
+    return (sum(1 for x in lst if x) / len(lst)) if lst else 0.0
+
+def _compute_em_drop(baseline_correct: List[bool], adapter_correct: List[bool], n_anchor: int) -> float:
+    """
+    EM drop on anchors (higher = worse). We treat anchors as the first n_anchor items
+    in the concatenated evaluation list (anchors + new).
+    """
+    if n_anchor <= 0:
+        return 0.0
+    em_base = _mean_bool(baseline_correct[:n_anchor])
+    em_new  = _mean_bool(adapter_correct [:n_anchor])
+    return max(0.0, em_base - em_new)
+
+def _metric_value_for_step(metric: str,
+                           baseline_correct: List[bool],
+                           adapter_correct: List[bool],
+                           n_anchor: int) -> Tuple[float, str]:
+    """
+    Returns (value, note). For step-5-only phase:
+      - 'em' is implemented.
+      - 'bits' and 'kl' gracefully fall back to EM with a note explaining why.
+    """
+    if metric == "em":
+        return _compute_em_drop(baseline_correct, adapter_correct, n_anchor), "em"
+    if metric in ("bits", "kl"):
+        # We need token log-probs / distributions, which are not available from the inner server reply.
+        # Until Step 2 is patched to return them (or to evaluate supplied adapters), we fall back to EM.
+        return _compute_em_drop(baseline_correct, adapter_correct, n_anchor), f"{metric}->em_fallback"
+    # default safe fallback
+    return _compute_em_drop(baseline_correct, adapter_correct, n_anchor), "em_fallback"
+
+#################
+
+
+
 
 ###############################################################################
 #                               Infra helpers                                 #
@@ -274,6 +321,11 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
         ]
         agg_questions.extend(new_q)
 
+
+
+
+'''
+#COMMENTING THIS OUT FOR NEW PATCH BELOW
         # ---------------- 4) tune-and-eval  -------------------------------
         rep_out = _send_round(zmq_sock, train_sequences, agg_questions, args)
         correct = rep_out["adapter_correct"]
@@ -282,6 +334,56 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
             acc = sum(correct[s:e]) / (e - s)
             mat_vals[k+1][i].append(acc)
         print([f"d{i}:{_stats.mean(mat_vals[k+1][i]):.3f}" for i in range(k + 1)])
+'''
+
+####################### Forgetting / safety metrics (step-5-first patch)###########################
+        # ---------------- 4) tune-and-eval  -------------------------------
+        rep_out = _send_round(zmq_sock, train_sequences, agg_questions, args)
+
+
+        # server provides both baselines and adapter results for the same eval set
+        base_corr   = rep_out.get("baseline_correct", [])
+        adpt_corr   = rep_out.get("adapter_correct", [])
+        A = sum(len(items[j]["questions"]) for j in range(k))  # number of anchor QAs so far
+
+        # ---- 4.a Measure forgetting (metric value) on anchors ----
+        forget_val, metric_note = _metric_value_for_step(args.forget_metric, base_corr, adpt_corr, A)
+        if args.forget_metric != "em":
+            _banner(f"[Info] forget_metric={args.forget_metric} not supported in step-5-only mode; using EM fallback ({metric_note}).")
+
+        # ---- 4.b Decide safety action at MERGE time ----
+        decision = "merge"  # default
+        budget = (
+            args.em_max_drop if args.forget_metric == "em"
+            else args.bits_max_total if args.forget_metric == "bits"
+            else args.kl_max_bits
+        )
+        mode = args.safety_mode
+        if mode == "baseline":
+            decision = "merge"
+        elif mode in ("gate_only", "lora_clip"):
+            # In step-5-only phase we cannot re-evaluate scaled adapters here; treat lora_clip == gate_only.
+            if forget_val > budget:
+                decision = "reject"
+            else:
+                decision = "merge"
+        else:
+            decision = "merge"
+
+        # ---- 4.c Choose which correctness to record for the triangular matrix ----
+        # The matrix should reflect the *model after the step*. If we reject, we must log BASELINE.
+        chosen_corr = adpt_corr if decision == "merge" else base_corr
+        for i in range(k + 1):
+            s, e = q_spans[i]
+            seg = chosen_corr[s:e]
+            acc = (sum(seg) / len(seg)) if seg else 0.0
+            mat_vals[k + 1][i].append(acc)
+        print([f"d{i}:{_stats.mean(mat_vals[k+1][i]):.3f}" for i in range(k + 1)])
+##########################
+
+
+
+#########################################################
 
         # ---------------- 5) grab adapter & merge into base ---------------
         adapter_path = Path(f"models/tmp_{args.zmq_port}_inner_TTT_0/final_adapter")
@@ -289,12 +391,29 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
         if not adapter_path.exists():
             print("[!] adapter not found - skipping merge, keeping previous base")
         else:
-            merged_dir = Path(args.output_dir) / f"merged_seq{seq_idx}_step{k}"
-            prev_model_path = current_model_path
-            current_model_path = _merge_lora(current_model_path, adapter_path, merged_dir)
+            #merged_dir = Path(args.output_dir) / f"merged_seq{seq_idx}_step{k}"
+            #prev_model_path = current_model_path
+            #current_model_path = _merge_lora(current_model_path, adapter_path, merged_dir)
+
+            # Decide merge based on safety decision
+            if decision == "reject":
+                _banner(f"[Safety] REJECT merge at step {k} | metric={args.forget_metric} value={forget_val:.4f} > budget={budget:.4f} | mode={mode}")
+                # do not merge; keep current_model_path as is
+                # optional: remove temp adapter directory to save disk
+                if adapter_path.exists():
+                    try:
+                        shutil.rmtree(adapter_path.parent, ignore_errors=True)
+                    except Exception:
+                        pass
+            else:
+                _banner(f"[Safety] MERGE at step {k} | metric={args.forget_metric} value={forget_val:.4f} ≤ budget={budget:.4f} | mode={mode}")
+                merged_dir = Path(args.output_dir) / f"merged_seq{seq_idx}_step{k}"
+                prev_model_path = current_model_path
+                current_model_path = _merge_lora(current_model_path, adapter_path, merged_dir)
 
             # Clean up previous merge dir if it's not the original base
-            if k > 0 and Path(prev_model_path).is_dir() and str(prev_model_path).startswith(str(Path(args.output_dir))):
+            #if k > 0 and Path(prev_model_path).is_dir() and str(prev_model_path).startswith(str(Path(args.output_dir))):
+            if decision == "merge" and k > 0 and Path(prev_model_path).is_dir() and str(prev_model_path).startswith(str(Path(args.output_dir))):    #newline 
                 try:
                     shutil.rmtree(prev_model_path)
                     print(f"[Cleanup] removed previous merge dir {prev_model_path}")
@@ -310,6 +429,31 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
                         print(f"[Cleanup] removed prior sequence's final merge dir {prev_final_merge}")
                     except Exception as exc:
                         print(f"[Cleanup] failed to remove {prev_final_merge}: {exc}")
+################################
+
+
+
+################################
+        # --------------- 5.b Optional per-step JSONL logging --------------
+        if args.log_jsonl:
+            try:
+                out = {
+                    "seq_idx": seq_idx,
+                    "step": k,
+                    "title": item["title"],
+                    "n_anchor": A,
+                    "forget_metric": args.forget_metric,
+                    "forget_value": round(forget_val, 6),
+                    "budget": round(budget, 6),
+                    "safety_mode": args.safety_mode,
+                    "decision": decision,  # "merge" | "reject"
+                    "acc_row_after_step": [round(_stats.mean(mat_vals[k+1][i]), 6) for i in range(k+1)],
+                }
+                with open(args.log_jsonl, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(out, ensure_ascii=False) + "\n")
+            except Exception as _e:
+                print("[log_jsonl] failed to write step log:", _e)
+############################
 
         # ---------------- 6) graceful shutdown ----------------------------
         try:
@@ -389,6 +533,26 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--end_mask_substring", default="")
 
+######################
+    # --------- Safety / forgetting controls (Step-5-first) ---------------
+    p.add_argument("--safety_mode",
+                   choices=["baseline", "gate_only", "lora_clip"],
+                   default="gate_only",
+                   help="baseline: always merge; gate_only: block merge if over budget; lora_clip: (stub here) acts like gate_only in step-5-only mode")
+    p.add_argument("--forget_metric",
+                   choices=["em", "bits", "kl"],
+                   default="em",
+                   help="For step-5-only phase, bits/kl fall back to EM (TTT server must be extended to support them).")
+    p.add_argument("--em_max_drop", type=float, default=0.0,
+                   help="Max allowed EM drop on anchors (0.00 = no regression).")
+    p.add_argument("--bits_max_total", type=float, default=1.0,
+                   help="(Placeholder) Max allowed sum of positive Δbits on anchors; falls back to EM in this phase.")
+    p.add_argument("--kl_max_bits", type=float, default=0.30,
+                   help="(Placeholder) Max allowed mean KL (bits/token) on anchors; falls back to EM in this phase.")
+    p.add_argument("--log_jsonl", default="",
+                   help="Optional: path to JSONL to append per-step safety/decision logs.")
+################################
+
     p.add_argument("--output_dir", default="general-knowledge/results/continual_self_edits")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     return p.parse_args()
@@ -419,6 +583,14 @@ def main():
         mean_mat, std_mat = run_one_sequence(seq_idx, items, args)
         seq_matrices_mean.append(mean_mat)
         seq_matrices_std.append(std_mat)
+
+#########################
+    if args.forget_metric in ("bits", "kl"):
+        _banner("[Reminder] You ran forget_metric=%s. In step-5-only mode this fell back to EM.\n"
+                "Next step: patch src/inner/TTT_server.py to compute Bits/KL and return them, or add a local logprob evaluator."
+                % args.forget_metric)
+#########################
+
 
     # -------- aggregate across sequences (simple arithmetic mean) --------
     K = args.n_datapoints

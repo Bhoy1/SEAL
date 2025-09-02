@@ -1,0 +1,25 @@
+python -m general-knowledge.src.continual.continual_self_edits \
+  --dataset data/synthetic_data/val/iter0_val.json \
+  --gpus "0,1" \
+  --safety_mode gate_only \
+  --forget_metric em \
+  --em_max_drop 0.00 \
+  --log_jsonl general-knowledge/results/continual_self_edits/steps.jsonl
+
+
+
+working on editting continual_self_edits, going to drop notes here
+{
+  "seq_idx": 0,
+  "step": 2,
+  "title": "Some Article",
+  "n_anchor": 14,
+  "forget_metric": "em",
+  "forget_value": 0.071429,
+  "budget": 0.0,
+  "safety_mode": "gate_only",
+  "decision": "reject",
+  "acc_row_after_step": [1.0, 0.0, 0.0]
+}
+
+
