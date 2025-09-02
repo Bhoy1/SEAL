@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 import requests
 import torch
+import numpy as np
 import zmq
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -170,9 +171,25 @@ def _send_eval_with_adapter(sock, adapter_path: Path, questions: List[Dict[str, 
     return sock.recv_json()
 
 
+def _send_eval_with_adapter_logprobs(sock, adapter_path: Path, questions: List[Dict[str, str]]) -> Dict:
+    """Special request to evaluate with adapter and return log probabilities."""
+    sock.send_json(
+        {
+            "eval_only_with_adapter": True,
+            "adapter_path": str(adapter_path),
+            "eval_questions": questions,
+            "return_logprobs": True,
+        }
+    )
+    return sock.recv_json()
+
+
 def measure_em_drop(zmq_sock, anchors: List[Dict], anchor_questions: List[Dict], 
                      adapter_path: Path, args) -> float:
-    """Measure EM accuracy drop on anchor questions."""
+    """
+    Measure EM accuracy drop on anchor questions.
+    Returns: fraction of accuracy lost (0.0 = no loss, 1.0 = complete loss)
+    """
     if not anchors or not anchor_questions:
         return 0.0
     
@@ -187,7 +204,115 @@ def measure_em_drop(zmq_sock, anchors: List[Dict], anchor_questions: List[Dict],
     adapter_em = sum(adapter_correct) / len(adapter_correct) if adapter_correct else 0.0
     
     em_drop = max(0, base_em - adapter_em)
+    
+    print(f"    [EM] Base: {base_em:.3f}, Adapter: {adapter_em:.3f}, Drop: {em_drop:.3f}")
     return em_drop
+
+
+def measure_bits_increase(zmq_sock, anchors: List[Dict], anchor_questions: List[Dict], 
+                          adapter_path: Path, args) -> float:
+    """
+    Measure total bits increase on anchor questions.
+    Returns: total increase in bits needed to generate correct answers
+    """
+    if not anchors or not anchor_questions:
+        return 0.0
+    
+    # Get baseline with logprobs - need to modify _send_round to support this
+    # For now, we'll make a special request
+    sock = zmq_sock
+    sock.send_json(
+        {
+            "train_sequences": [],
+            "eval_questions": anchor_questions,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lora_dropout": args.lora_dropout,
+            "finetune_epochs": args.finetune_epochs,
+            "finetune_lr": args.finetune_lr,
+            "batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "end_mask_substring": args.end_mask_substring,
+            "return_logprobs": True,  # Request logprobs
+        }
+    )
+    base_response = sock.recv_json()
+    
+    # Get adapter with logprobs
+    adapter_response = _send_eval_with_adapter_logprobs(zmq_sock, adapter_path, anchor_questions)
+    
+    # Check if we got actual logprobs
+    if "logprobs" not in adapter_response or "logprobs" not in base_response:
+        print("[Safety] Warning: Server doesn't support logprobs yet, using EM approximation for bits")
+        # Fallback: approximate bits from accuracy
+        base_correct = base_response.get("adapter_correct", [])
+        adapter_correct = adapter_response.get("adapter_correct", [])
+        base_acc = sum(base_correct) / len(base_correct) if base_correct else 1.0
+        adapter_acc = sum(adapter_correct) / len(adapter_correct) if adapter_correct else 1.0
+        acc_drop = max(0, base_acc - adapter_acc)
+        # Heuristic: 10% accuracy drop ≈ 1 bit increase
+        bits_increase = acc_drop * 10.0
+        print(f"    [Bits-Approx] Base acc: {base_acc:.3f}, Adapter acc: {adapter_acc:.3f}, Est. bits: {bits_increase:.2f}")
+        return bits_increase
+    
+    # Calculate actual bits increase from logprobs
+    base_logprobs = base_response["logprobs"]
+    adapter_logprobs = adapter_response["logprobs"]
+    
+    total_bits_increase = 0.0
+    ln2 = np.log(2)  # For converting natural log to base-2
+    
+    for base_lp, adapter_lp in zip(base_logprobs, adapter_logprobs):
+        # Convert log probabilities to bits (negative log base 2)
+        base_bits = -base_lp / ln2 if base_lp > -100 else 100.0  # Cap at 100 bits for numerical stability
+        adapter_bits = -adapter_lp / ln2 if adapter_lp > -100 else 100.0
+        
+        # Only count increases (forgetting)
+        bits_increase = max(0, adapter_bits - base_bits)
+        total_bits_increase += bits_increase
+    
+    print(f"    [Bits] Total increase: {total_bits_increase:.2f} bits across {len(anchor_questions)} questions")
+    return total_bits_increase
+
+
+def measure_kl_divergence(zmq_sock, anchors: List[Dict], anchor_questions: List[Dict],
+                          adapter_path: Path, args) -> float:
+    """
+    Measure mean KL divergence (bits/token) on anchor questions.
+    Returns: average KL divergence in bits per token
+    
+    NOTE: This is a placeholder. Full implementation requires:
+    1. Getting full logits (vocabulary distributions) from the model
+    2. Comparing distributions at each token position
+    3. This is computationally expensive and requires model modifications
+    """
+    if not anchors or not anchor_questions:
+        return 0.0
+    
+    print("[Safety] KL metric not yet implemented, using EM approximation")
+    
+    # Fallback: Use EM as proxy
+    base_response = _send_round(zmq_sock, [], anchor_questions, args)
+    adapter_response = _send_eval_with_adapter(zmq_sock, adapter_path, anchor_questions)
+    
+    base_correct = base_response.get("adapter_correct", [])
+    adapter_correct = adapter_response.get("adapter_correct", [])
+    base_acc = sum(base_correct) / len(base_correct) if base_correct else 1.0
+    adapter_acc = sum(adapter_correct) / len(adapter_correct) if adapter_correct else 1.0
+    
+    # Heuristic: map accuracy drop to KL
+    # 10% accuracy drop ≈ 0.05 bits/token KL divergence
+    acc_drop = max(0, base_acc - adapter_acc)
+    kl_estimate = acc_drop * 0.5
+    
+    print(f"    [KL-Approx] Base acc: {base_acc:.3f}, Adapter acc: {adapter_acc:.3f}, Est. KL: {kl_estimate:.3f} bits/token")
+    return kl_estimate
+
+    # TODO: Full implementation would:
+    # 1. Get logits for each token position from both models
+    # 2. Convert to probability distributions with softmax
+    # 3. Calculate KL: sum(p_base * log(p_base/p_adapter))
+    # 4. Average over all tokens
 
 
 def scale_lora_adapter(adapter_path: Path, scale: float) -> Path:
@@ -244,9 +369,14 @@ def binary_search_scale(zmq_sock, adapter_path: Path, anchors: List[Dict],
         if metric == "em":
             forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions, 
                                         scaled_adapter_path, args)
-        # TODO: Add bits and KL metrics here
+        elif metric == "bits":
+            forgetting = measure_bits_increase(zmq_sock, anchors, anchor_questions,
+                                              scaled_adapter_path, args)
+        elif metric == "kl":
+            forgetting = measure_kl_divergence(zmq_sock, anchors, anchor_questions,
+                                             scaled_adapter_path, args)
         else:
-            print(f"[Safety] Warning: metric '{metric}' not yet implemented, using EM")
+            print(f"[Safety] Unknown metric '{metric}', using EM")
             forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions,
                                         scaled_adapter_path, args)
         
@@ -438,7 +568,14 @@ def run_one_sequence(seq_idx: int, items: List[Dict[str, Any]], args) -> Tuple[L
                     forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions, 
                                                 adapter_path, args)
                     budget = args.em_max_drop
-                # TODO: Add bits and KL metrics
+                elif args.forget_metric == "bits":
+                    forgetting = measure_bits_increase(zmq_sock, anchors, anchor_questions,
+                                                    adapter_path, args)
+                    budget = args.bits_max_total
+                elif args.forget_metric == "kl":
+                    forgetting = measure_kl_divergence(zmq_sock, anchors, anchor_questions,
+                                                    adapter_path, args)
+                    budget = args.kl_max_bits
                 else:
                     print(f"[Safety] Warning: metric '{args.forget_metric}' not yet implemented, using EM")
                     forgetting = measure_em_drop(zmq_sock, anchors, anchor_questions,

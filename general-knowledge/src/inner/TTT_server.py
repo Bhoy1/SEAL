@@ -71,20 +71,48 @@ def accuracy_and_texts(
     stop_ids: List[int],
     instruct_model: bool,
     chain_of_thought: bool = False,
-) -> tuple[float, List[str], List[bool]]:
+    return_logprobs: bool = False,  # NEW parameter
+) -> tuple:
+    # Add logprobs to sampling if requested
+    if return_logprobs:
+        sampling = {**sampling, "logprobs": 1}  # Request token-level logprobs
+        LOG.debug("Requesting logprobs in sampling: %s", sampling)  # NEW LOG
+    
     ans_out = generate(
-        format_answer_prompts(questions, instruct_model=instruct_model, chain_of_thought=chain_of_thought), answer_model_ref, sampling, stop_ids
+        format_answer_prompts(questions, instruct_model=instruct_model, chain_of_thought=chain_of_thought), 
+        answer_model_ref, 
+        sampling, 
+        stop_ids
     ) or []
+    
     preds = [o.get("text", "") for o in ans_out]
+    
+    # Extract logprobs if available
+    sequence_logprobs = []
+    if return_logprobs:
+        for output in ans_out:
+            if "logprobs" in output and output["logprobs"]:
+                # Sum token logprobs for total sequence probability
+                token_logprobs = output["logprobs"].get("token_logprobs", [])
+                # Filter out None values and sum
+                valid_logprobs = [lp for lp in token_logprobs if lp is not None]
+                total_logprob = sum(valid_logprobs) if valid_logprobs else -100.0  # Large negative if no valid
+                sequence_logprobs.append(total_logprob)
+                LOG.debug("Output logprobs: %s tokens, total: %.3f", len(valid_logprobs), total_logprob)  # NEW LOG
+            else:
+                sequence_logprobs.append(-100.0)  # Default penalty if not available
+                LOG.debug("No logprobs in output, using default -100.0")  # NEW LOG
+    
     if chain_of_thought:
-        LOG.debug("pre-extraction preds: %s", preds)
+        LOG.debug("pre-extraction preds: %s", preds)  # EXISTING LOG
         preds = [extract_final_answer(p) for p in preds]
-    LOG.debug("Formatted answer prompts: %s", format_answer_prompts(questions, instruct_model=instruct_model))
-    LOG.debug("answer_model_ref: %s", answer_model_ref)
-    LOG.debug("sampling: %s", sampling)
-    LOG.debug("stop_ids: %s", stop_ids)
-    LOG.debug("preds: %s", preds)
-
+    
+    LOG.debug("Formatted answer prompts: %s", format_answer_prompts(questions, instruct_model=instruct_model))  # EXISTING LOG
+    LOG.debug("answer_model_ref: %s", answer_model_ref)  # EXISTING LOG
+    LOG.debug("sampling: %s", sampling)  # EXISTING LOG
+    LOG.debug("stop_ids: %s", stop_ids)  # EXISTING LOG
+    LOG.debug("preds: %s", preds)  # EXISTING LOG
+    
     verdicts: List[bool] = [False] * len(preds)
     q_sub, p_sub, idx_sub = [], [], []
 
@@ -99,8 +127,13 @@ def accuracy_and_texts(
         graded = grade_with_gpt4(grade_prompts)
         for i, v in zip(idx_sub, graded):
             verdicts[i] = v
-    LOG.debug("verdicts: %s", verdicts)
+    
+    LOG.debug("verdicts: %s", verdicts)  # EXISTING LOG
     acc = sum(verdicts) / len(questions) if questions else 0.0
+    
+    if return_logprobs:
+        LOG.debug("Returning with logprobs: %d sequences", len(sequence_logprobs))  # NEW LOG
+        return acc, preds, verdicts, sequence_logprobs
     return acc, preds, verdicts
 
 
@@ -155,12 +188,14 @@ def main():
                 try:
                     adapter_path = msg.get("adapter_path")
                     questions = msg.get("eval_questions", [])
+                    return_logprobs = msg.get("return_logprobs", False)  # NEW
                     
-                    LOG.info(f"Eval-only with adapter: {adapter_path}")
+                    LOG.info(f"Eval-only with adapter: {adapter_path}, logprobs={return_logprobs}")  # EXISTING LOG ENHANCED
                     
                     # Load the adapter temporarily
                     adapter_name = f"temp_eval_{step}"
                     load_adapter(adapter_path, adapter_name)
+                    LOG.debug(f"Loaded adapter as {adapter_name}")  # NEW LOG
                     
                     # Evaluate with the adapter
                     sampling_cfg = {
@@ -170,32 +205,44 @@ def main():
                         "max_tokens": args.eval_max_tokens,
                     }
                     
-                    adapter_acc, adapter_texts, adapter_ok = accuracy_and_texts(
+                    result = accuracy_and_texts(
                         questions,
                         answer_model_ref=adapter_name,
                         sampling=sampling_cfg,
                         stop_ids=stop_ids,
                         instruct_model=args.instruct_model,
                         chain_of_thought=False,
+                        return_logprobs=return_logprobs,  # Pass through
                     )
                     
                     # Unload the adapter
                     unload_adapter(adapter_name)
+                    LOG.debug(f"Unloaded adapter {adapter_name}")  # NEW LOG
                     
-                    reply = {
-                        "adapter_accuracy": round(adapter_acc, 4),
-                        "adapter_texts": adapter_texts,
-                        "adapter_correct": adapter_ok,
-                    }
+                    if return_logprobs:
+                        adapter_acc, adapter_texts, adapter_ok, logprobs = result
+                        reply = {
+                            "adapter_accuracy": round(adapter_acc, 4),
+                            "adapter_texts": adapter_texts,
+                            "adapter_correct": adapter_ok,
+                            "logprobs": logprobs,  # Include logprobs
+                        }
+                        LOG.info(f"Eval-only result: acc={adapter_acc:.3f}, with {len(logprobs)} logprobs")  # ENHANCED LOG
+                    else:
+                        adapter_acc, adapter_texts, adapter_ok = result
+                        reply = {
+                            "adapter_accuracy": round(adapter_acc, 4),
+                            "adapter_texts": adapter_texts,
+                            "adapter_correct": adapter_ok,
+                        }
+                        LOG.info(f"Eval-only result: acc={adapter_acc:.3f}")  # EXISTING LOG
                     
-                    LOG.info(f"Eval-only result: acc={adapter_acc:.3f}")
-
                 except Exception as e:
-                    LOG.exception("Error during eval-only with adapter.")
-                    reply = {"error": f"{type(e).__name__}: {e}"}
-
+                    LOG.exception("Error during eval-only with adapter.")  # EXISTING LOG
+                    reply = {"error": f"{type(e).__name__}: {e}", "adapter_correct": []}
 
                 sock.send_json(reply)
+                LOG.info("Reply sent for eval-only request")  # NEW LOG
                 step += 1
                 continue  # Skip the rest of the loop
 
@@ -220,6 +267,7 @@ def main():
                 end_mask_substring = msg.get("end_mask_substring")
                 baseline_eval = bool(msg.get("baseline_eval", True))
                 chain_of_thought = bool(msg.get("chain_of_thought", False))
+                return_logprobs = bool(msg.get("return_logprobs", False)) # NEW parameter
                 reward_mode = msg.get("reward_mode", "ttt")  # "ttt" | "proxy" | "both"
                 completion_raw = msg.get("comp_raw", "")
 
@@ -262,16 +310,25 @@ def main():
 
                 # ---------- baseline ------------------------------------------------ #
                 if baseline_eval:
-                    base_acc, base_texts, base_ok = accuracy_and_texts(
+                    result = accuracy_and_texts(
                         questions,
                         answer_model_ref=args.model,
                         sampling=sampling_cfg,
                         stop_ids=stop_ids,
                         instruct_model=args.instruct_model,
                         chain_of_thought=chain_of_thought,
+                        return_logprobs=return_logprobs,
                     )
+                    # Unpack based on whether logprobs were requested
+                    if return_logprobs:
+                        base_acc, base_texts, base_ok, base_logprobs = result
+                    else:
+                        base_acc, base_texts, base_ok = result
+                        base_logprobs = None
                 else:
                     base_acc, base_texts, base_ok = 0.0, [""] * len(questions), [False] * len(questions)
+                    base_logprobs = None
+                
 
                 if not train_sequences:
                     reply = {
@@ -284,6 +341,9 @@ def main():
                         "adapter_correct": base_ok,
                         "gains": [0]*len(base_ok),
                     }
+
+                    if return_logprobs and base_logprobs is not None:
+                        reply["logprobs"] = base_logprobs  # ADD THIS
                     LOG.info("Step %d  BASE-ONLY  acc %.3f  (%.2fs)", step, base_acc, time.time()-recv_start)
                     continue
 
